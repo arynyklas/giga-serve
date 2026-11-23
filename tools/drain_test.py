@@ -35,7 +35,7 @@ def post(i):
         return i, repr(e)[:80], 0, round(time.time() - t0, 2)
 
 
-pid = int(subprocess.check_output(["pgrep", "-f", "^python3 giga_serve.py"]).split()[0])
+pid = int(subprocess.check_output(["pgrep", "-f", r"^python3 (\S*/)?giga_serve\.py"]).split()[0])
 with cf.ThreadPoolExecutor(N + 1) as ex:
     futs = [ex.submit(post, i) for i in range(N)]
     time.sleep(1.0)

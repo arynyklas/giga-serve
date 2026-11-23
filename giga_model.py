@@ -14,6 +14,7 @@ import json
 import math
 import os
 import time
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -28,16 +29,42 @@ try:
 except Exception as _e:  # CPU unit tests
     HAVE_CUDA_OPS, _CUDA_OPS_ERR = False, _e
 
+Tensor = torch.Tensor
 
 
-def yarn_mscale(scale, mscale=1.0):
+def yarn_mscale(scale: float, mscale: float = 1.0) -> float:
     return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
 
 
 class Cfg:
     """The subset of config.json the forward needs; anything this code does not implement is refused."""
 
-    def __init__(self, c):
+    hidden: int
+    layers: int
+    heads: int
+    nope: int
+    rope: int
+    vdim: int
+    qk: int
+    kv_lora: int
+    inter: int
+    moe_inter: int
+    n_exp: int
+    topk: int
+    first_dense: int
+    norm_topk: bool
+    routed_scale: float
+    eps: float
+    vocab: int
+    rope_theta: float
+    yarn_factor: float
+    yarn_orig_max: int
+    beta_fast: float
+    beta_slow: float
+    scaling: float
+    cs_mscale: float
+
+    def __init__(self, c: dict[str, Any]) -> None:
         assert c.get("q_lora_rank") is None, "q_lora_rank is not supported"
         assert c["scoring_func"] == "sigmoid" and c["topk_method"] == "noaux_tc", "router"
         assert c["n_group"] == 1 and c.get("topk_group", 1) == 1, "grouped routing"
@@ -76,21 +103,21 @@ class Cfg:
         self.cs_mscale = yarn_mscale(self.yarn_factor, float(rs.get("mscale", 1))) / m_all
 
 
-def load_cfg(path):
+def load_cfg(path: str) -> Cfg:
     with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
         return Cfg(json.load(f))
 
 
-def yarn_cos_sin(cfg, max_pos, device):
+def yarn_cos_sin(cfg: Cfg, max_pos: int, device: torch.device) -> Tensor:
     """[max_pos, rope] fp32, cos half then sin half: vLLM's DeepseekScalingRotaryEmbedding cache, op for op
     and ON THE DEVICE (vLLM builds it under the CUDA default device; CPU cos/sin differ by an ulp)."""
     dim, base = cfg.rope, cfg.rope_theta
 
-    def corr_dim(rot):
+    def corr_dim(rot: float) -> float:
         return dim * math.log(cfg.yarn_orig_max / (rot * 2 * math.pi)) / (2 * math.log(base))
 
     low = max(math.floor(corr_dim(cfg.beta_fast)), 0)
-    high = min(math.ceil(corr_dim(cfg.beta_slow)), dim - 1)
+    high: float = min(math.ceil(corr_dim(cfg.beta_slow)), dim - 1)  # int; vLLM nudges it to a float below
     if low == high:
         high += 0.001
     pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim)
@@ -103,7 +130,7 @@ def yarn_cos_sin(cfg, max_pos, device):
     return torch.cat((freqs.cos() * cfg.cs_mscale, freqs.sin() * cfg.cs_mscale), dim=-1)
 
 
-def rope_gptj_(x, cos_sin, pos):
+def rope_gptj_(x: Tensor, cos_sin: Tensor, pos: Tensor) -> None:
     """In-place interleaved (GPT-J) rotation of x [T, h, rope], computed in fp32 (CPU path)."""
     cos, sin = cos_sin[pos.long()].float().chunk(2, dim=-1)
     cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
@@ -113,24 +140,46 @@ def rope_gptj_(x, cos_sin, pos):
 
 
 class Layer:
-    pass
+    """One decoder layer's weights. Dense layers set gu/dn; MoE layers set the rest of the MLP group."""
+
+    moe: bool
+    in_norm: Tensor
+    post_norm: Tensor
+    q: Tensor
+    kv_a: Tensor
+    kv_ln: Tensor
+    kv_b: Tensor
+    o: Tensor
+    # dense MLP
+    gu: Tensor
+    dn: Tensor
+    # MoE
+    w13: Tensor
+    w2: Tensor
+    gate_w: Tensor
+    gate_bias: Tensor
+    sh_gu: Tensor
+    sh_dn: Tensor
+    seen: set[tuple[int, str]]  # loading only
 
 
 class GigaEmbedModel:
-    def __init__(self, cfg: Cfg, device, dtype=torch.bfloat16, max_pos=2048):
+    def __init__(self, cfg: Cfg, device: torch.device, dtype: torch.dtype = torch.bfloat16,
+                 max_pos: int = 2048) -> None:
         self.cfg, self.device, self.dtype = cfg, device, dtype
         self.cuda = device.type == "cuda"
         if self.cuda and not HAVE_CUDA_OPS:
             raise RuntimeError(f"CUDA kernels unavailable: {_CUDA_OPS_ERR!r}")
-        self._taps, self._li = None, 0
+        self._taps: dict[str, Tensor] | None = None
+        self._li = 0
         # vLLM sizes the cache by original_max_position * factor; any length up to max_pos is the same rows.
         self.cos_sin = yarn_cos_sin(cfg, max_pos, device)
-        self.embed = None
-        self.norm_w = None
-        self.layers = []
+        self.embed: Tensor | None = None
+        self.norm_w: Tensor | None = None
+        self.layers: list[Layer] = []
 
     # ---- weights ----------------------------------------------------------------------------
-    def load(self, path):
+    def load(self, path: str) -> float:
         """Loads model-*.safetensors straight to the device. Returns seconds taken."""
         from safetensors import safe_open
 
@@ -142,7 +191,7 @@ class GigaEmbedModel:
                 l.w13 = torch.empty(c.n_exp, 2 * c.moe_inter, c.hidden, dtype=dt, device=dev)
                 l.w2 = torch.empty(c.n_exp, c.hidden, c.moe_inter, dtype=dt, device=dev)
                 l.seen = set()
-        part = {}
+        part: dict[tuple[int, str], Tensor] = {}
         t0 = time.time()
         files = sorted(glob.glob(os.path.join(path, "model-*.safetensors")))
         if not files:
@@ -181,7 +230,7 @@ class GigaEmbedModel:
                     else:
                         part[(i, rest)] = w.to(dt)
         for i, l in enumerate(layers):
-            def g(k):
+            def g(k: str) -> Tensor:
                 return part.pop((i, k))
 
             l.in_norm = g("input_layernorm.weight")
@@ -215,7 +264,7 @@ class GigaEmbedModel:
         return time.time() - t0
 
     # ---- ops ----------------------------------------------------------------------------------
-    def _rms(self, x, w):
+    def _rms(self, x: Tensor, w: Tensor) -> Tensor:
         if self.cuda:
             out = torch.empty_like(x)
             vops.rms_norm(out, x, w, self.cfg.eps)
@@ -223,7 +272,7 @@ class GigaEmbedModel:
         xf = x.float()
         return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.cfg.eps)).to(x.dtype) * w
 
-    def _add_rms(self, x, res, w):
+    def _add_rms(self, x: Tensor, res: Tensor, w: Tensor) -> tuple[Tensor, Tensor]:
         """(rms(x + res), x + res); in place on CUDA like vLLM's fused_add_rms_norm."""
         if self.cuda:
             vops.fused_add_rms_norm(x, res, w, self.cfg.eps)
@@ -231,7 +280,7 @@ class GigaEmbedModel:
         s = x + res
         return self._rms(s, w), s
 
-    def _silu_mul(self, x):
+    def _silu_mul(self, x: Tensor) -> Tensor:
         d = x.shape[-1] // 2
         if self.cuda:
             out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
@@ -239,9 +288,10 @@ class GigaEmbedModel:
             return out
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def _route(self, h, l):
+    def _route(self, h: Tensor, l: Layer) -> tuple[Tensor, Tensor]:
         c = self.cfg
         logits = F.linear(h, l.gate_w)
+        self._tap("mlp.gate", logits)
         if self.cuda:
             w, idx = vops.grouped_topk(logits, 1, 1, c.topk, c.norm_topk, c.routed_scale, l.gate_bias, 1, None)
             return w, idx.to(torch.int32)
@@ -252,7 +302,7 @@ class GigaEmbedModel:
             w = w / w.sum(-1, keepdim=True)
         return w * c.routed_scale, idx.to(torch.int32)
 
-    def _experts(self, h, l, w, idx):
+    def _experts(self, h: Tensor, l: Layer, w: Tensor, idx: Tensor) -> Tensor:
         if self.cuda:
             return fused_experts(h, l.w13, l.w2, w, idx)
         out = torch.zeros_like(h, dtype=torch.float32)
@@ -263,11 +313,12 @@ class GigaEmbedModel:
                 out.index_add_(0, tok, y * w[tok, slot].unsqueeze(-1))
         return out.to(h.dtype)
 
-    def _attn_core(self, q, k, v, cu, max_len, out):
+    def _attn_core(self, q: Tensor, k: Tensor, v: Tensor, cu: Tensor, max_len: int, out: Tensor | None) -> Tensor:
         if self.cuda:
-            return flash_attn_varlen_func(q, k, v, max_seqlen_q=max_len, cu_seqlens_q=cu, max_seqlen_k=max_len,
-                                          cu_seqlens_k=cu, softmax_scale=self.cfg.scaling, causal=False,
-                                          fa_version=3, out=out)
+            o_fa: Tensor = flash_attn_varlen_func(q, k, v, max_seqlen_q=max_len, cu_seqlens_q=cu,
+                                                  max_seqlen_k=max_len, cu_seqlens_k=cu,
+                                                  softmax_scale=self.cfg.scaling, causal=False, fa_version=3, out=out)
+            return o_fa
         o = torch.zeros(q.shape[0], q.shape[1], v.shape[2], dtype=q.dtype)
         cl = cu.tolist()
         for a, b in zip(cl[:-1], cl[1:]):
@@ -278,11 +329,12 @@ class GigaEmbedModel:
         return o
 
     # ---- forward ------------------------------------------------------------------------------
-    def _tap(self, name, t):
+    def _tap(self, name: str, t: Tensor) -> None:
         if self._taps is not None and self._li < 2:
             self._taps[f"{self._li}.{name}"] = t.clone()
 
-    def attention(self, h, l, pos, cu, max_len, attn_out=None):
+    def attention(self, h: Tensor, l: Layer, pos: Tensor, cu: Tensor, max_len: int,
+                  attn_out: Tensor | None = None) -> Tensor:
         c = self.cfg
         T, H = h.shape[0], c.heads
         # two GEMMs, not one over [q; kv_a]: vLLM's shapes, so cuBLAS picks the same algorithms
@@ -316,10 +368,9 @@ class GigaEmbedModel:
         self._tap("self_attn.attn", o.reshape(T, -1))
         return F.linear(o.reshape(T, H * c.vdim), l.o)
 
-    def mlp(self, h, l):
+    def mlp(self, h: Tensor, l: Layer) -> Tensor:
         if not l.moe:
             return F.linear(self._silu_mul(F.linear(h, l.gu)), l.dn)
-        self._tap("mlp.gate", F.linear(h, l.gate_w))
         w, idx = self._route(h, l)
         shared = F.linear(self._silu_mul(F.linear(h, l.sh_gu)), l.sh_dn)
         self._tap("mlp.shared_experts", shared)
@@ -328,15 +379,18 @@ class GigaEmbedModel:
         return routed.add_(shared)
 
     @torch.inference_mode()
-    def hidden(self, ids, pos, cu, max_len, attn_out=None, taps=None):
+    def hidden(self, ids: Tensor, pos: Tensor, cu: Tensor, max_len: int, attn_out: Tensor | None = None,
+               taps: dict[str, Tensor] | None = None) -> Tensor:
         """[T] ids -> [T, hidden] final-normed hidden states. `taps` (dict) collects per-layer outputs."""
+        embed, norm_w = self.embed, self.norm_w
+        if embed is None or norm_w is None:
+            raise RuntimeError("weights not loaded")
         self._taps = taps
-        h = F.embedding(ids, self.embed)
-        res = None
+        h = F.embedding(ids, embed)
+        res = h
         for i, l in enumerate(self.layers):
             self._li = i
-            if res is None:
-                res = h
+            if i == 0:
                 h = self._rms(h, l.in_norm)
             else:
                 h, res = self._add_rms(h, res, l.in_norm)
@@ -348,12 +402,12 @@ class GigaEmbedModel:
             h = self.mlp(h, l)
             if taps is not None:
                 taps[f"{i}.mlp"] = h.clone()
-        h, _ = self._add_rms(h, res, self.norm_w)
+        h, _ = self._add_rms(h, res, norm_w)
         self._taps = None
         return h
 
     @torch.inference_mode()
-    def pool(self, h, seg, lens_f, nrows):
+    def pool(self, h: Tensor, seg: Tensor, lens_f: Tensor, nrows: int) -> tuple[Tensor, Tensor]:
         """MEAN pool [T, hidden] by segment id into [nrows, hidden] fp32 -> (raw mean, L2-normalised).
         Rows past len(lens_f) are scratch (padding tokens are pooled into the last row)."""
         acc = torch.zeros(nrows, h.shape[1], dtype=torch.float32, device=h.device)

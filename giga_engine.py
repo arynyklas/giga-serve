@@ -13,17 +13,36 @@ one (two staging slots), so a saturated GPU does not idle between steps.
 Any exception in the engine thread is fatal: every waiting request fails and `on_fatal` is
 called (the server exits so a supervisor can restart it), as vLLM does when its EngineCore dies.
 """
+from __future__ import annotations
+
 import collections
 import threading
 import time
+from typing import TYPE_CHECKING, Callable, Literal, Protocol
 
 import numpy as np
+import numpy.typing as npt
 import torch
+
+if TYPE_CHECKING:
+    from giga_model import GigaEmbedModel
 
 # Token buckets for graph capture; a step is padded up to the next one.
 T_BUCKETS = (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
 # Max-sequence-length buckets: FA3's max_seqlen is baked into a graph and must be >= the real one.
 L_BUCKETS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+TokenIds = npt.NDArray[np.int32]
+Vectors = npt.NDArray[np.float32]
+StepMode = Literal["graph", "eager"]
+
+
+class EngineMetrics(Protocol):
+    """What the engine reports; giga_serve.Metrics implements it."""
+
+    def step(self, tokens: int, seconds: float, mode: StepMode) -> None: ...
+
+    def aborted(self, n: int) -> None: ...
 
 
 class Job:
@@ -31,17 +50,21 @@ class Job:
 
     __slots__ = ("seqs", "out", "raw", "next", "pending", "cancelled", "done", "t_arrive", "t_start", "ntok")
 
-    def __init__(self, seqs, dim, done):
+    def __init__(self, seqs: list[TokenIds], dim: int, done: DoneCallback) -> None:
         self.seqs = seqs
-        self.out = np.empty((len(seqs), dim), dtype=np.float32)
-        self.raw = np.empty((len(seqs), dim), dtype=np.float32)
+        self.out: Vectors = np.empty((len(seqs), dim), dtype=np.float32)
+        self.raw: Vectors = np.empty((len(seqs), dim), dtype=np.float32)
         self.next = 0
         self.pending = len(seqs)
         self.cancelled = False
         self.done = done  # called from the engine thread: done(job, error_or_None)
         self.t_arrive = time.monotonic()
-        self.t_start = None
+        self.t_start: float | None = None
         self.ntok = int(sum(len(s) for s in seqs))
+
+
+DoneCallback = Callable[[Job, BaseException | None], None]
+StepItem = tuple[Job, int]  # (job, index of the sequence in job.seqs)
 
 
 class EngineDead(RuntimeError):
@@ -51,16 +74,21 @@ class EngineDead(RuntimeError):
 class Slot:
     """Pinned host staging for one in-flight step."""
 
-    def __init__(self, max_tokens, max_seqs, dim):
+    def __init__(self, max_tokens: int, max_seqs: int, dim: int) -> None:
         self.h64 = torch.zeros(3 * max_tokens, dtype=torch.int64, pin_memory=True)  # ids | pos | seg
         self.h32 = torch.zeros(max_seqs + 1, dtype=torch.int32, pin_memory=True)  # cu_seqlens
         self.hout = torch.zeros(2, max_seqs, dim, dtype=torch.float32, pin_memory=True)  # raw, normalised
-        self.done = torch.cuda.Event(blocking=True)
-        self.items, self.tot, self.mode, self.t0 = None, 0, None, 0.0
+        self.done = torch.cuda.Event(blocking=True)  # type: ignore[no-untyped-call]
+        self.items: list[StepItem] | None = None
+        self.tot = 0
+        self.mode: StepMode = "graph"
+        self.t0 = 0.0
 
 
 class Engine:
-    def __init__(self, model, *, max_tokens, max_seqs, max_len, graph_max_tokens, metrics, on_fatal):
+    def __init__(self, model: GigaEmbedModel, *, max_tokens: int, max_seqs: int, max_len: int,
+                 graph_max_tokens: int, metrics: EngineMetrics,
+                 on_fatal: Callable[[BaseException], None]) -> None:
         self.m = model
         self.dim = model.cfg.hidden
         self.max_tokens, self.max_seqs, self.max_len = max_tokens, max_seqs, max_len
@@ -69,16 +97,16 @@ class Engine:
         self.metrics = metrics
         self.on_fatal = on_fatal
         self.cv = threading.Condition()
-        self.queue = collections.deque()
+        self.queue: collections.deque[Job] = collections.deque()
         self.queued_tokens = 0
         self.queued_seqs = 0
         self.running_seqs = 0
         self.stopping = False
-        self.dead = None
+        self.dead: BaseException | None = None
         self.dev = model.device
         self.thread = threading.Thread(target=self._run, name="giga-engine", daemon=True)
         self.slots = [Slot(max_tokens, max_seqs, self.dim) for _ in range(2)]
-        self.graphs = {}
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.graph_max_tokens = graph_max_tokens
         self.t_buckets = [t for t in T_BUCKETS if t < graph_max_tokens] + [graph_max_tokens] if graph_max_tokens else []
         self.l_buckets = [l for l in L_BUCKETS if l < max_len] + [max_len]
@@ -91,7 +119,7 @@ class Engine:
             self.pool = torch.cuda.graph_pool_handle()
 
     # ---- startup ----------------------------------------------------------------------------
-    def _graph_body(self, Tp, Lp):
+    def _graph_body(self, Tp: int, Lp: int) -> None:
         Tg = self.graph_max_tokens
         Bp = min(self.max_seqs, Tp)
         ids, pos, seg = self.g64[:Tp], self.g64[Tg:Tg + Tp], self.g64[2 * Tg:2 * Tg + Tp]
@@ -102,7 +130,7 @@ class Engine:
         self.g_out[0, :Bp + 1].copy_(raw)
         self.g_out[1, :Bp + 1].copy_(out)
 
-    def capture(self):
+    def capture(self) -> tuple[int, float]:
         """One graph per (token bucket, length bucket) a step can map to."""
         t0 = time.time()
         for Tp in self.t_buckets:
@@ -122,7 +150,7 @@ class Engine:
                 self.graphs[(Tp, Lp)] = g
         return len(self.graphs), time.time() - t0
 
-    def warmup_eager(self):
+    def warmup_eager(self) -> tuple[int, float]:
         """Compile/autotune the eager path for every step size above the graph range."""
         t0 = time.time()
         sizes = sorted({t for t in T_BUCKETS + (12288, 16384, 24576, 32768, self.max_tokens)
@@ -135,11 +163,11 @@ class Engine:
         torch.cuda.synchronize()
         return len(sizes), time.time() - t0
 
-    def start(self):
+    def start(self) -> None:
         self.thread.start()
 
     # ---- request side -----------------------------------------------------------------------
-    def submit(self, job):
+    def submit(self, job: Job) -> None:
         with self.cv:
             if self.dead is not None:
                 raise EngineDead(str(self.dead))
@@ -148,7 +176,7 @@ class Engine:
             self.queued_seqs += len(job.seqs)
             self.cv.notify()
 
-    def cancel(self, job):
+    def cancel(self, job: Job) -> None:
         """Client went away: sequences not yet on the GPU are dropped."""
         with self.cv:
             if job.cancelled or job.pending == 0:
@@ -161,16 +189,17 @@ class Engine:
             job.next = len(job.seqs)
             self.metrics.aborted(len(left))
 
-    def stop(self):
+    def stop(self) -> None:
         with self.cv:
             self.stopping = True
             self.cv.notify()
         self.thread.join(timeout=30)
 
     # ---- engine thread ----------------------------------------------------------------------
-    def _form(self):
+    def _form(self) -> tuple[list[StepItem], int]:
         """Lock held. Pops (job, index) items off the queue head within the step budget."""
-        items, tot = [], 0
+        items: list[StepItem] = []
+        tot = 0
         while self.queue and len(items) < self.max_seqs:
             job = self.queue[0]
             while job.next < len(job.seqs) and len(items) < self.max_seqs:
@@ -190,7 +219,7 @@ class Engine:
         self.queued_seqs -= len(items)
         return items, tot
 
-    def _launch_eager(self, slot, seqs):
+    def _launch_eager(self, slot: Slot, seqs: list[TokenIds]) -> None:
         """Exact-size forward (no padding) into slot.hout; asynchronous."""
         B = len(seqs)
         lens = np.fromiter((len(s) for s in seqs), dtype=np.int64, count=B)
@@ -211,7 +240,7 @@ class Engine:
         slot.hout[0, :B].copy_(raw, non_blocking=True)
         slot.hout[1, :B].copy_(out, non_blocking=True)
 
-    def _stage_graph(self, slot, seqs, Tp):
+    def _stage_graph(self, slot: Slot, seqs: list[TokenIds], Tp: int) -> None:
         """Fills the static graph inputs for a step padded to Tp tokens (H2D on the stream)."""
         Tg = self.graph_max_tokens
         B, Bp = len(seqs), min(self.max_seqs, Tp)
@@ -229,11 +258,11 @@ class Engine:
         cu[B + 1:Bp + 1] = tot  # empty sequences: padding is in no attention segment
         pos[:tot] = np.arange(tot) - cu[:B][seg[:tot]]
         pos[tot:] = 0
-        for a in (0, Tg, 2 * Tg):
-            self.g64[a:a + Tp].copy_(slot.h64[a:a + Tp], non_blocking=True)
+        # ids | pos | seg sit at the same offsets in the pinned slot and in g64: one H2D copy for all three
+        self.g64[:2 * Tg + Tp].copy_(slot.h64[:2 * Tg + Tp], non_blocking=True)
         self.g32[:Bp + 1].copy_(slot.h32[:Bp + 1], non_blocking=True)
 
-    def _launch(self, slot, items, tot):
+    def _launch(self, slot: Slot, items: list[StepItem], tot: int) -> None:
         seqs = [job.seqs[i] for job, i in items]
         slot.items, slot.tot, slot.t0 = items, tot, time.perf_counter()
         if tot <= self.graph_max_tokens:
@@ -251,12 +280,14 @@ class Engine:
             slot.mode = "eager"
         slot.done.record()
 
-    def _finish(self, slot):
+    def _finish(self, slot: Slot) -> None:
         slot.done.synchronize()
         self.metrics.step(slot.tot, time.perf_counter() - slot.t0, slot.mode)
-        items, B = slot.items, len(slot.items)
+        items = slot.items
+        assert items is not None
+        B = len(items)
         raw, out = slot.hout[0, :B].numpy(), slot.hout[1, :B].numpy()
-        finished = []
+        finished: list[Job] = []
         with self.cv:
             for k, (job, i) in enumerate(items):
                 if job.cancelled:
@@ -271,13 +302,14 @@ class Engine:
         for job in finished:
             job.done(job, None)
 
-    def _run(self):
+    def _run(self) -> None:
         torch.cuda.set_device(self.dev)
-        inflight = collections.deque()
-        free = collections.deque(self.slots)
+        inflight: collections.deque[Slot] = collections.deque()
+        free: collections.deque[Slot] = collections.deque(self.slots)
         try:
             while True:
-                items = None
+                items: list[StepItem] | None = None
+                tot = 0
                 with self.cv:
                     while not self.queue and not inflight and not self.stopping:
                         self.cv.wait()
@@ -300,13 +332,13 @@ class Engine:
         except BaseException as e:  # noqa: BLE001 -- any failure here leaves the GPU state unknown
             self._die(e, [it for s in self.slots if s.items for it in s.items])
 
-    def _die(self, e, inflight):
+    def _die(self, e: BaseException, inflight: list[StepItem]) -> None:
         import traceback
 
         traceback.print_exc()
         with self.cv:
             self.dead = e
-            jobs = {id(j): j for j, _ in inflight}
+            jobs: dict[int, Job] = {id(j): j for j, _ in inflight}
             jobs.update((id(j), j) for j in self.queue)
             self.queue.clear()
         for job in jobs.values():

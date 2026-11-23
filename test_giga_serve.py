@@ -183,6 +183,16 @@ def test_encodings_and_bytes_contract():
     assert off == len(body) and meta["usage"] == {"prompt_tokens": 7, "total_tokens": 7}
     st, hd, body = S.build_response(vecs, opts("bytes_only"), "embd-x", 1, "m", 7)
     assert b"metadata" not in dict(hd) and len(body) == 3 * 6144
+    # build_response encodes the whole batch at once: must equal the per-row encodings, for every
+    # dtype / endianness and for a non-contiguous row selection.
+    for dtype in S.EMBED_DTYPES:
+        for endian in S.ENDIANNESS:
+            rows = vecs[::2]
+            per_row = [S.encode_vector(np.ascontiguousarray(r), dtype, endian) for r in rows]
+            st, hd, body = S.build_response(rows, opts("bytes", dtype, endian), "embd-x", 1, "m", 7)
+            assert body == b"".join(per_row), (dtype, endian)
+            j = json.loads(S.build_response(rows, opts("base64", dtype, endian), "embd-x", 1, "m", 7)[2])
+            assert [base64.b64decode(d["embedding"]) for d in j["data"]] == per_row, (dtype, endian)
 
 
 def test_too_long_message():

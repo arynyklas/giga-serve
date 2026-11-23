@@ -5,7 +5,8 @@ An OpenAI-compatible embeddings server for
 (a bidirectional DeepSeek-V3-style MoE, 10B total / 1.8B active, 1536-dim vectors, mean pooling).
 
 It replaces a vLLM pooling engine for this one model. The forward pass calls **vLLM v0.34.0's own
-kernels in vLLM's exact order**, so the vectors are bit-identical to vLLM's. Only the serving path is
+kernels in vLLM's exact order**, so on the same batch every layer output is bit-identical to vLLM's
+(vectors too, up to the order of fp32 atomics in the mean pool). Only the serving path is
 new: one process, one token-budget batcher, and CUDA graphs. The result is ~1.05x vLLM's throughput
 on batched requests, **1.45–3x on single-text requests**, and 4.4x lower single-request latency.
 
@@ -145,16 +146,40 @@ Each case was checked on the H200:
   - a tiny DeepSeek-V3 checked against transformers' `DeepseekV3Model` made non-causal;
   - request parsing, truncation, every response encoding, and the `bytes` metadata contract.
 - `tools/layercmp.py MODEL_DIR [N]`: per-layer bit comparison against vLLM in-process. Needs a GPU.
+  Exits 1 if any layer output differs, so it works as a gate.
 - `tools/bench.py URL MODEL CONC BATCH NREQ OUT.npy [WORDS] [ENC]`: throughput and a vector dump.
 - `tools/retrieval_eval.py embed|score ...`: retrieval A/B (nDCG, recall, MRR, per-vector cosine)
   on RuBQ and SciFact.
 - `tools/drain_test.py URL MODEL N WORDS`: SIGTERM drain check.
+
+The three server modules are fully annotated and pass `mypy --strict` (config in `pyproject.toml`).
+vLLM, FlashInfer and the other untyped dependencies are treated as `Any`. To run the checks:
+
+```sh
+docker run --rm --entrypoint sh -v "$PWD:/src" -w /src \
+  vllm/vllm-openai:v0.34.0@sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484 \
+  -c 'pip install -q mypy && mypy && python3 test_giga_serve.py'
+```
 
 ## Upgrading the base image
 
 The server imports private vLLM APIs (`vllm._custom_ops`, `fused_moe.fused_experts`,
 `vllm_flash_attn`), so the base image is pinned by digest. Before shipping a new base, run
 `tools/layercmp.py` on a GPU and require bit-equal layer taps.
+
+## Possible next steps
+
+These are not done yet. Each one needs `tools/layercmp.py`; the ones marked *numerics* also need the
+retrieval A/B, because they change values.
+
+- Tune the CUDA-graph token buckets to the observed step-size histogram
+  (`vllm:iteration_tokens_total`); padding to the next bucket wastes up to ~30% of a small step.
+  *Numerics:* the padded shape changes the GEMM tiling.
+- Copy back only the requested variant (normalised or raw) instead of both.
+- Assemble K in one kernel instead of two slice copies per layer.
+- A segmented mean-pool kernel instead of `index_add_` over an fp32 copy of the hidden states.
+  *Numerics:* reduction order.
+- Batch-invariant kernels, so a vector would not depend on its batch neighbours. *Numerics.*
 
 ## License
 

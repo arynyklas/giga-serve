@@ -5,7 +5,8 @@
 Runs one vLLM step over N token-id prompts with forward hooks on every layer (and every
 sub-module of layers 0-1), runs giga_model on the same flat batch in vLLM's order, and prints the
 max abs difference per tap and the final cosine. Expected on the image giga-serve pins: every tap
-bit-equal; vectors bit-equal up to the order of fp32 atomics in the mean pool.
+bit-equal; vectors bit-equal up to the order of fp32 atomics in the mean pool. Exits 1 if any layer
+output differs or the vector cosine drops below 0.99999, so it can gate a base-image bump.
 """
 import os
 import random
@@ -134,6 +135,10 @@ def main():
                 first = (key, d)
     print(f"layer outputs: first diff {first}, max |d| {worst:.3g} | emb cos min {cos.min():.7f} mean "
           f"{cos.mean():.8f}, bit-equal vectors {(emb.cpu() == ref_emb).all(1).sum().item()}/{N}", flush=True)
+    if worst > 0 or cos.min().item() < 0.99999:
+        print("FAIL: giga_model is not bit-equal to this vLLM build", flush=True)
+        sys.exit(1)
+    print("PASS", flush=True)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ GPU in giga_engine's thread. The port opens only after the weights are loaded, t
 captured and the eager sizes warmed. SIGTERM stops accepting, finishes every accepted request
 (up to --shutdown-timeout), then exits. If the engine thread fails the process exits non-zero.
 """
+from __future__ import annotations
+
 import argparse
 import asyncio
 import base64
@@ -27,38 +29,73 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Awaitable, Callable, Iterable, MutableMapping
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, get_args
 
 import numpy as np
+import numpy.typing as npt
 import orjson
 
-ENCODINGS = ("float", "base64", "bytes", "bytes_only")
-EMBED_DTYPES = ("float32", "float16", "bfloat16", "fp8_e4m3", "fp8_e5m2")
-ENDIANNESS = ("native", "big", "little")
+if TYPE_CHECKING:
+    from tokenizers import Tokenizer
+
+    from giga_engine import Engine, Job, StepMode
+
+Encoding = Literal["float", "base64", "bytes", "bytes_only"]
+EmbedDtype = Literal["float32", "float16", "bfloat16", "fp8_e4m3", "fp8_e5m2"]
+Endianness = Literal["native", "big", "little"]
+Side = Literal["left", "right"]
+ENCODINGS: tuple[Encoding, ...] = get_args(Encoding)
+EMBED_DTYPES: tuple[EmbedDtype, ...] = get_args(EmbedDtype)
+ENDIANNESS: tuple[Endianness, ...] = get_args(Endianness)
 FIELDS = {"model", "input", "encoding_format", "embed_dtype", "endianness", "dimensions", "user",
           "truncate_prompt_tokens", "truncation_side", "add_special_tokens", "use_activation",
           "request_id", "priority", "padding", "mm_processor_kwargs", "cache_salt"}
 MAX_BODY = 64 << 20
 
+# ASGI 3 without a framework dependency
+Message = MutableMapping[str, Any]
+Receive = Callable[[], Awaitable[Message]]
+Send = Callable[[Message], Awaitable[None]]
+Headers = Iterable[tuple[bytes, bytes]]
+Vectors = npt.NDArray[np.float32]
+
+
+class EmbeddingOptions(TypedDict):
+    """parse_embedding_request's result: exactly one of `texts` / `ids` is set."""
+
+    texts: list[str] | None
+    ids: list[list[int]] | None
+    fmt: Encoding
+    dtype: EmbedDtype
+    endian: Endianness
+    trunc: int | None
+    side: Side
+    add_special: bool
+    normalize: bool
+
 
 class HTTPError(Exception):
-    def __init__(self, code, message, typ="BadRequestError", param=None):
+    def __init__(self, code: int, message: str, typ: str = "BadRequestError", param: str | None = None) -> None:
         super().__init__(message)
         self.code, self.message, self.typ, self.param = code, message, typ, param
 
-    def body(self):
+    def body(self) -> bytes:
         return orjson.dumps({"error": {"message": self.message, "type": self.typ, "param": self.param,
                                        "code": self.code}})
 
 
-def bad(message, param=None):
+def bad(message: str, param: str | None = None) -> HTTPError:
     return HTTPError(400, message, "BadRequestError", param)
 
 
 # ---- request parsing (pure; unit-tested) -------------------------------------------------------
-def parse_embedding_request(req, served, dim_supported=False):
-    """Validates an /v1/embeddings body. Returns a dict of normalised options."""
+def parse_embedding_request(req: object, served: str, dim_supported: bool = False) -> EmbeddingOptions:
+    """Validates an /v1/embeddings body. Returns the normalised options."""
     if not isinstance(req, dict):
         raise bad("request body must be a JSON object")
+    texts: list[str] | None
+    ids: list[list[int]] | None
     if "normalize" in req:
         raise bad("Parameter `normalize` was removed; use `use_activation` instead. (parameter=normalize)", "normalize")
     model = req.get("model")
@@ -95,19 +132,20 @@ def parse_embedding_request(req, served, dim_supported=False):
     trunc = req.get("truncate_prompt_tokens")
     if trunc is not None and (not isinstance(trunc, int) or isinstance(trunc, bool) or trunc < -1):
         raise bad("truncate_prompt_tokens: Input should be greater than or equal to -1", "truncate_prompt_tokens")
-    side = req.get("truncation_side") or "right"
-    if side not in ("left", "right"):
+    side_in = req.get("truncation_side") or "right"
+    if side_in not in ("left", "right"):
         raise bad("truncation_side: Input should be 'left' or 'right'", "truncation_side")
+    side: Side = "left" if side_in == "left" else "right"
     add_special = req.get("add_special_tokens", True)
     use_act = req.get("use_activation")
     for name, val in (("add_special_tokens", add_special), ("use_activation", use_act)):
         if val is not None and not isinstance(val, bool):
             raise bad(f"{name}: Input should be a valid boolean", name)
-    return dict(texts=texts, ids=ids, fmt=fmt, dtype=dtype, endian=endian, trunc=trunc, side=side,
-                add_special=bool(add_special), normalize=use_act is not False)
+    return EmbeddingOptions(texts=texts, ids=ids, fmt=fmt, dtype=dtype, endian=endian, trunc=trunc, side=side,
+                            add_special=bool(add_special), normalize=use_act is not False)
 
 
-def truncate(ids, k, side):
+def truncate(ids: list[int], k: int | None, side: Side) -> list[int]:
     """vLLM's _token_truncation: keep the first (right) or last (left) k tokens, special tokens included.
     Right truncation equals HF's (BOS + the first k-1 tokens); an explicit left one drops BOS."""
     if k is None or len(ids) <= k:
@@ -117,7 +155,7 @@ def truncate(ids, k, side):
     return ids[-k:] if side == "left" else ids[:k]
 
 
-def too_long(max_len):
+def too_long(max_len: int) -> HTTPError:
     n = max_len + 1
     return bad(f"This model's maximum context length is {max_len} tokens. However, you requested 0 output tokens "
                f"and your prompt contains at least {n} input tokens, for a total of at least {n} tokens. Please reduce "
@@ -125,8 +163,9 @@ def too_long(max_len):
                f"value={n})")
 
 
-def encode_vector(vec, dtype, endian):
-    """fp32 vector -> bytes in embed_dtype / endianness, as vLLM's tensor2binary."""
+def encode_vector(vec: Vectors, dtype: EmbedDtype, endian: Endianness) -> bytes:
+    """fp32 vector(s) -> bytes in embed_dtype / endianness, as vLLM's tensor2binary. Element-wise, so a
+    C-contiguous [n, dim] matrix encodes to the n row encodings back to back."""
     if dtype == "float32":
         arr = vec.astype("<f4" if endian != "big" else ">f4", copy=False)
         return arr.tobytes()
@@ -142,7 +181,8 @@ def encode_vector(vec, dtype, endian):
     return t.to(tt).view(torch.uint8).numpy().tobytes()
 
 
-def build_response(vecs, opts, rid, created, served, ntok):
+def build_response(vecs: Vectors, opts: EmbeddingOptions, rid: str, created: int, served: str,
+                   ntok: int) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
     """-> (status, headers, body) for float / base64 / bytes / bytes_only."""
     usage = {"prompt_tokens": ntok, "total_tokens": ntok, "completion_tokens": 0,
              "prompt_tokens_details": None, "completion_tokens_details": None}
@@ -152,24 +192,24 @@ def build_response(vecs, opts, rid, created, served, ntok):
         body = orjson.dumps({"id": rid, "object": "list", "created": created, "model": served, "data": data,
                              "usage": usage}, option=orjson.OPT_SERIALIZE_NUMPY)
         return 200, [(b"content-type", b"application/json")], body
-    chunks = [encode_vector(vecs[i], opts["dtype"], opts["endian"]) for i in range(len(vecs))]
+    # one conversion for the whole batch, then per-row views: same bytes as encoding row by row
+    blob = encode_vector(np.ascontiguousarray(vecs), opts["dtype"], opts["endian"])
+    rb = len(blob) // len(vecs)
+    view = memoryview(blob)
     if fmt == "base64":
-        data = [{"index": i, "object": "embedding", "embedding": base64.b64encode(c).decode()}
-                for i, c in enumerate(chunks)]
+        data = [{"index": i, "object": "embedding", "embedding": base64.b64encode(view[i * rb:(i + 1) * rb]).decode()}
+                for i in range(len(vecs))]
         body = orjson.dumps({"id": rid, "object": "list", "created": created, "model": served, "data": data,
                              "usage": usage})
         return 200, [(b"content-type", b"application/json")], body
     headers = [(b"content-type", b"application/octet-stream")]
     if fmt == "bytes":
-        items, off = [], 0
-        for i, c in enumerate(chunks):
-            items.append({"index": i, "embed_dtype": opts["dtype"], "endianness": opts["endian"],
-                          "start": off, "end": off + len(c), "shape": [len(vecs[i])]})
-            off += len(c)
+        items = [{"index": i, "embed_dtype": opts["dtype"], "endianness": opts["endian"],
+                  "start": i * rb, "end": (i + 1) * rb, "shape": [vecs.shape[1]]} for i in range(len(vecs))]
         meta = {"id": rid, "created": created, "model": served, "data": items,
                 "usage": {"prompt_tokens": ntok, "total_tokens": ntok}}
         headers.append((b"metadata", json.dumps(meta).encode()))
-    return 200, headers, b"".join(chunks)
+    return 200, headers, blob
 
 
 # ---- metrics ----------------------------------------------------------------------------------
@@ -179,7 +219,7 @@ class Metrics:
     TIME_BUCKETS = (0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 120.0,
                     240.0, 480.0, 960.0, 1920.0, 7680.0)
 
-    def __init__(self, served):
+    def __init__(self, served: str) -> None:
         from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
         self.registry = r = CollectorRegistry()
@@ -221,16 +261,16 @@ class Metrics:
         self._steps = {"graph": self.step_seconds.labels(mode="graph"), "eager": self.step_seconds.labels(mode="eager")}
         self.window = [0, 0, 0]  # steps, tokens, seqs since the last log line
 
-    def step(self, tokens, seconds, mode):
+    def step(self, tokens: int, seconds: float, mode: StepMode) -> None:
         self.iter_tokens.observe(tokens)
         self._steps[mode].observe(seconds)
         self.window[0] += 1
         self.window[1] += tokens
 
-    def aborted(self, n):
+    def aborted(self, n: int) -> None:
         self.abort.inc(n)
 
-    def finished(self, job):
+    def finished(self, job: Job) -> None:
         now = time.monotonic()
         n = len(job.seqs)
         self.ok.inc(n)
@@ -244,7 +284,7 @@ class Metrics:
             self.queue.observe(start - job.t_arrive)
             self.infer.observe(now - start)
 
-    def render(self, engine):
+    def render(self, engine: Engine) -> bytes:
         from prometheus_client import generate_latest
 
         self.running.set(engine.running_seqs)
@@ -254,7 +294,7 @@ class Metrics:
 
 # ---- server -----------------------------------------------------------------------------------
 class Server:
-    def __init__(self, args, tokenizer, engine, metrics):
+    def __init__(self, args: argparse.Namespace, tokenizer: Tokenizer, engine: Engine, metrics: Metrics) -> None:
         self.args, self.tok, self.engine, self.metrics = args, tokenizer, engine, metrics
         self.served = args.served_model_name
         self.max_len = args.max_model_len
@@ -264,8 +304,9 @@ class Server:
         self.created = int(time.time())
 
     # -- helpers
-    async def read_body(self, receive):
-        chunks, size = [], 0
+    async def read_body(self, receive: Receive) -> bytes | None:
+        chunks: list[bytes] = []
+        size = 0
         while True:
             m = await receive()
             if m["type"] == "http.disconnect":
@@ -279,18 +320,19 @@ class Server:
                 return b"".join(chunks)
 
     @staticmethod
-    async def send(send, status, body, headers=((b"content-type", b"application/json"),)):
+    async def send(send: Send, status: int, body: bytes,
+                   headers: Headers = ((b"content-type", b"application/json"),)) -> None:
         hdrs = list(headers) + [(b"content-length", str(len(body)).encode())]
         await send({"type": "http.response.start", "status": status, "headers": hdrs})
         await send({"type": "http.response.body", "body": body})
 
-    def tokenize(self, texts, add_special, trunc, side):
+    def tokenize(self, texts: list[str], add_special: bool, trunc: int | None, side: Side) -> list[list[int]]:
         encs = self.tok.encode_batch(texts, add_special_tokens=add_special)
         k = self.max_len if trunc == -1 else trunc
         return [truncate(e.ids, k, side) for e in encs]
 
     # -- endpoints
-    async def embeddings(self, receive, send):
+    async def embeddings(self, receive: Receive, send: Send) -> int:
         raw = await self.read_body(receive)
         if raw is None:
             return 499
@@ -303,20 +345,22 @@ class Server:
         if trunc is not None and trunc > self.max_len:
             raise bad("truncate_prompt_tokens value is greater than max_model_len. Please request a smaller "
                       "truncation size.")
+        ids: list[list[int]]
         if opts["texts"] is not None:
             texts = opts["texts"]
-            if sum(len(t) for t in texts) > 4096:
+            if sum(len(t) for t in texts) > 4096:  # characters: small inputs tokenize on the loop
                 ids = await asyncio.get_running_loop().run_in_executor(
                     self.pool, self.tokenize, texts, opts["add_special"], trunc, opts["side"])
             else:
                 ids = self.tokenize(texts, opts["add_special"], trunc, opts["side"])
         else:
+            assert opts["ids"] is not None
             k = self.max_len if trunc == -1 else trunc
             ids = [truncate(list(x), k, opts["side"]) for x in opts["ids"]]
             for x in ids:
-                for t in x:
-                    if t < 0 or t >= self.vocab:
-                        raise bad(f"Token id {t} is out of vocabulary")
+                if x and (min(x) < 0 or max(x) >= self.vocab):
+                    t = next(t for t in x if t < 0 or t >= self.vocab)
+                    raise bad(f"Token id {t} is out of vocabulary")
         for x in ids:
             if len(x) > self.max_len:
                 raise too_long(self.max_len)
@@ -330,18 +374,19 @@ class Server:
         if eng.queued_tokens and eng.queued_tokens + ntok > self.args.max_queued_tokens:
             raise HTTPError(503, f"server busy: {eng.queued_tokens} tokens queued", "ServiceUnavailableError")
         loop = asyncio.get_running_loop()
-        fut = loop.create_future()
+        fut: asyncio.Future[BaseException | None] = loop.create_future()
 
-        def done(job, err):
-            loop.call_soon_threadsafe(_resolve, fut, job, err)
+        def done(job: Job, err: BaseException | None) -> None:
+            loop.call_soon_threadsafe(_resolve, fut, err)
 
         from giga_engine import Job
 
         job = Job(seqs, eng.dim, done)
         eng.submit(job)
         watch = asyncio.ensure_future(receive())  # resolves on http.disconnect
+        waiters: set[asyncio.Future[Any]] = {fut, watch}
         try:
-            finished, _ = await asyncio.wait({fut, watch}, return_when=asyncio.FIRST_COMPLETED)
+            finished, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
             if fut not in finished:
                 eng.cancel(job)
                 return 499
@@ -358,7 +403,7 @@ class Server:
         await self.send(send, status, body, headers)
         return status
 
-    async def tokenize_ep(self, receive, send):
+    async def tokenize_ep(self, receive: Receive, send: Send) -> int:
         raw = await self.read_body(receive)
         if raw is None:
             return 499
@@ -376,12 +421,12 @@ class Server:
                                                  "token_strs": None}))
         return 200
 
-    def models_body(self):
+    def models_body(self) -> bytes:
         return orjson.dumps({"object": "list", "data": [{
             "id": self.served, "object": "model", "created": self.created, "owned_by": "giga-serve",
             "root": self.args.model, "parent": None, "max_model_len": self.max_len, "permission": []}]})
 
-    async def app(self, scope, receive, send):
+    async def app(self, scope: Message, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
             while True:
                 m = await receive()
@@ -434,13 +479,13 @@ class Server:
                 self.metrics.http.labels(path=path, code=str(code)).inc()
 
 
-def _resolve(fut, job, err):
+def _resolve(fut: asyncio.Future[BaseException | None], err: BaseException | None) -> None:
     if not fut.done():
         fut.set_result(err)
 
 
 # ---- startup ----------------------------------------------------------------------------------
-def parse_args(argv=None):
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--model", required=True, help="checkpoint directory")
     p.add_argument("--served-model-name", required=True)
@@ -458,11 +503,11 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def log(msg):
+def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} giga-serve {msg}", flush=True)
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
     # tokenizers' encode_batch runs on rayon's global pool, one thread per host CPU by default
@@ -487,7 +532,7 @@ def main(argv=None):
         f"{torch.cuda.get_device_name(0)}, torch {torch.__version__}")
     metrics = Metrics(args.served_model_name)
 
-    def on_fatal(err):
+    def on_fatal(err: BaseException) -> None:
         log(f"FATAL engine error, exiting: {err!r}")
         threading.Timer(1.0, lambda: os._exit(1)).start()
 
@@ -503,7 +548,7 @@ def main(argv=None):
     eng.start()
     server = Server(args, tok, eng, metrics)
 
-    def stats_loop():
+    def stats_loop() -> None:
         last = time.monotonic()
         while True:
             time.sleep(args.log_interval)

@@ -1,0 +1,24 @@
+[project]
+name = "giga-serve"
+version = "0.1.0"
+description = "Embeddings server for ai-sage/Giga-Embeddings-instruct-10B-A1.8B-0826 on vLLM's kernels"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+# Runtime dependencies come from the pinned vllm/vllm-openai:v0.34.0 base image (see Dockerfile).
+
+[tool.mypy]
+python_version = "3.12"
+files = ["giga_model.py", "giga_engine.py", "giga_serve.py"]
+strict = true
+warn_unreachable = true
+
+# No stubs for these; the private kernels they export are called with vLLM's own argument order.
+[[tool.mypy.overrides]]
+module = ["vllm.*", "flashinfer.*", "safetensors.*", "uvicorn.*", "prometheus_client.*", "tokenizers.*"]
+ignore_missing_imports = true
+follow_untyped_imports = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
