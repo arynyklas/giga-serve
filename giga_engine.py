@@ -120,9 +120,9 @@ class Engine:
 
     # ---- startup ----------------------------------------------------------------------------
     def _graph_body(self, Tp: int, Lp: int) -> None:
-        Tg = self.graph_max_tokens
         Bp = min(self.max_seqs, Tp)
-        ids, pos, seg = self.g64[:Tp], self.g64[Tg:Tg + Tp], self.g64[2 * Tg:2 * Tg + Tp]
+        # ids | pos | seg packed back to back for this bucket: one contiguous H2D copy per step
+        ids, pos, seg = self.g64[:Tp], self.g64[Tp:2 * Tp], self.g64[2 * Tp:3 * Tp]
         cu = self.g32[:Bp + 1]
         h = self.m.hidden(ids, pos, cu, Lp, attn_out=self.g_attn[:Tp])
         lens_f = (cu[1:] - cu[:-1]).float().clamp_(min=1.0)
@@ -242,12 +242,11 @@ class Engine:
 
     def _stage_graph(self, slot: Slot, seqs: list[TokenIds], Tp: int) -> None:
         """Fills the static graph inputs for a step padded to Tp tokens (H2D on the stream)."""
-        Tg = self.graph_max_tokens
         B, Bp = len(seqs), min(self.max_seqs, Tp)
         lens = np.fromiter((len(s) for s in seqs), dtype=np.int64, count=B)
         tot = int(lens.sum())
         h = slot.h64.numpy()
-        ids, pos, seg = h[:Tp], h[Tg:Tg + Tp], h[2 * Tg:2 * Tg + Tp]
+        ids, pos, seg = h[:Tp], h[Tp:2 * Tp], h[2 * Tp:3 * Tp]  # the layout _graph_body reads
         ids[:tot] = np.concatenate(seqs)
         ids[tot:] = 0
         seg[:tot] = np.repeat(np.arange(B), lens)
@@ -258,8 +257,7 @@ class Engine:
         cu[B + 1:Bp + 1] = tot  # empty sequences: padding is in no attention segment
         pos[:tot] = np.arange(tot) - cu[:B][seg[:tot]]
         pos[tot:] = 0
-        # ids | pos | seg sit at the same offsets in the pinned slot and in g64: one H2D copy for all three
-        self.g64[:2 * Tg + Tp].copy_(slot.h64[:2 * Tg + Tp], non_blocking=True)
+        self.g64[:3 * Tp].copy_(slot.h64[:3 * Tp], non_blocking=True)
         self.g32[:Bp + 1].copy_(slot.h32[:Bp + 1], non_blocking=True)
 
     def _launch(self, slot: Slot, items: list[StepItem], tot: int) -> None:
