@@ -15,7 +15,7 @@ warn_unreachable = true
 
 # No stubs for these; the private kernels they export are called with vLLM's own argument order.
 [[tool.mypy.overrides]]
-module = ["vllm.*", "flashinfer.*", "safetensors.*", "uvicorn.*", "prometheus_client.*", "tokenizers.*"]
+module = ["vllm.*", "flashinfer.*", "safetensors.*", "uvicorn.*", "prometheus_client.*", "tokenizers.*", "triton.*"]
 ignore_missing_imports = true
 follow_untyped_imports = false
 

@@ -27,8 +27,10 @@ import torch
 if TYPE_CHECKING:
     from giga_model import GigaEmbedModel
 
-# Token buckets for graph capture; a step is padded up to the next one.
-T_BUCKETS = (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
+# Token buckets for graph capture; a step is padded up to the next one. Above 512 tokens the step is
+# compute-bound, so buckets there are at most 1.25x apart (padding waste <= 25%).
+T_BUCKETS = (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072,
+             3584, 4096, 6144, 8192)
 # Max-sequence-length buckets: FA3's max_seqlen is baked into a graph and must be >= the real one.
 L_BUCKETS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 

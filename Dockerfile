@@ -23,6 +23,7 @@ ENV PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=true
 
 COPY giga_model.py giga_engine.py giga_serve.py test_giga_serve.py /app/
+COPY moe_configs/ /app/moe_configs/
 COPY tools/layercmp.py tools/bench.py tools/drain_test.py /app/tools/
 
 # Imports the server needs, all from the base; then the CPU tests (model math vs transformers'

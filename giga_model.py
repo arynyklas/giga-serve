@@ -19,13 +19,35 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+# Tile configs for vLLM's fused_moe tuned on this model's shapes (moe_configs/, keyed by step size). Every
+# config there gives bit-identical outputs to vLLM's shipped one; it only changes speed. vLLM caches the
+# lookup on the first fused_experts call, so this must be set before any of it runs.
+os.environ.setdefault("VLLM_TUNED_CONFIG_FOLDER",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_configs"))
+
 try:
+    import triton
+    import triton.language as tl
     from vllm import _custom_ops as vops
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
     from vllm.vllm_flash_attn import flash_attn_varlen_func
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
     HAVE_CUDA_OPS, _CUDA_OPS_ERR = True, None
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _k_assemble(kv_ptr, pe_ptr, out_ptr, kv_st, kv_sh, pe_st, NOPE: tl.constexpr, ROPE: tl.constexpr,  # type: ignore[no-untyped-def]
+                    QK: tl.constexpr, H: tl.constexpr, BLOCK_H: tl.constexpr):  # Triton kernel: args are pointers/ints
+        """out[t, h] = [kv[t, h, :NOPE] | pe[t, :]]: one pass instead of two strided slice copies."""
+        t = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        dn = tl.arange(0, NOPE)
+        dr = tl.arange(0, ROPE)
+        nope = tl.load(kv_ptr + t * kv_st + h[:, None] * kv_sh + dn[None, :])
+        pe = tl.load(pe_ptr + t * pe_st + dr)
+        row = out_ptr + t * (H * QK) + h[:, None] * QK
+        tl.store(row + dn[None, :], nope)
+        tl.store(row + NOPE + dr[None, :], tl.broadcast_to(pe[None, :], (BLOCK_H, ROPE)))
 except Exception as _e:  # CPU unit tests
     HAVE_CUDA_OPS, _CUDA_OPS_ERR = False, _e
 
@@ -177,6 +199,13 @@ class GigaEmbedModel:
         self.embed: Tensor | None = None
         self.norm_w: Tensor | None = None
         self.layers: list[Layer] = []
+
+        def pow2(n: int) -> bool:
+            return n > 0 and n & (n - 1) == 0
+
+        # Triton K assembly needs power-of-two head-dim tiles; heads are processed BLOCK_H at a time
+        self._k_block_h = next((b for b in (32, 16, 8, 4, 2, 1) if cfg.heads % b == 0), 0) \
+            if self.cuda and pow2(cfg.nope) and pow2(cfg.rope) else 0
 
     # ---- weights ----------------------------------------------------------------------------
     def load(self, path: str) -> float:
@@ -358,12 +387,18 @@ class GigaEmbedModel:
         self._tap("self_attn.rotary_emb.q", q_pe)
         self._tap("self_attn.rotary_emb.k", k_pe)
         k = torch.empty_like(q)
-        k[..., : c.nope] = kv[..., : c.nope]
-        k[..., c.nope:] = k_pe
+        if self._k_block_h:  # same values as the slice copies below, in one kernel
+            assert kv.stride(2) == 1 and k_pe.stride(2) == 1, "_k_assemble indexes the head dim with stride 1"
+            _k_assemble[(T, H // self._k_block_h)](kv, k_pe, k, kv.stride(0), kv.stride(1), k_pe.stride(0),
+                                                   NOPE=c.nope, ROPE=c.rope, QK=c.qk, H=H, BLOCK_H=self._k_block_h)
+        else:
+            k[..., : c.nope] = kv[..., : c.nope]
+            k[..., c.nope:] = k_pe
         v = kv[..., c.nope:]
-        self._tap("self_attn.attn_in.q", q.reshape(T, -1))
-        self._tap("self_attn.attn_in.k", k.reshape(T, -1))
-        self._tap("self_attn.attn_in.v", v.reshape(T, -1))
+        if self._taps is not None:  # v is a strided view: its reshape is a full copy, only pay it when tapping
+            self._tap("self_attn.attn_in.q", q.reshape(T, -1))
+            self._tap("self_attn.attn_in.k", k.reshape(T, -1))
+            self._tap("self_attn.attn_in.v", v.reshape(T, -1))
         o = self._attn_core(q, k, v, cu, max_len, attn_out)
         self._tap("self_attn.attn", o.reshape(T, -1))
         return F.linear(o.reshape(T, H * c.vdim), l.o)
